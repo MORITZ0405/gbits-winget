@@ -1,0 +1,72 @@
+name: winget update
+
+# Schaut stündlich, ob auf gbits.eu ein neuer Windows-Installer liegt, und reicht dann
+# automatisch einen Pull Request bei microsoft/winget-pkgs ein (wingetcreate update).
+# Braucht das Repo-Secret WINGET_TOKEN (in MORITZ0405/gbits-winget): klassischer GitHub-Token
+# von MORITZ0405 mit Scope "public_repo" (der PR kommt über den Fork MORITZ0405/winget-pkgs).
+# Läuft erst, sobald MT-Media.gbits einmal in winget aufgenommen wurde.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: winget
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    name: Neue Version an winget melden
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      PKG: MT-Media.gbits
+    steps:
+      - name: Prüfen, ob es eine neue Version gibt
+        id: check
+        shell: pwsh
+        run: |
+          function Skip($msg) { Write-Host "::notice::$msg"; "skip=true" >> $env:GITHUB_OUTPUT; exit 0 }
+
+          $app = (Invoke-RestMethod "https://gbits.eu/api/win/version" -Headers @{ "User-Agent" = "gbits-winget-action" }).app
+          if (-not $app -or $app.kind -ne "installer" -or -not $app.version) { Skip "Kein Installer auf gbits.eu gemeldet." }
+          $ver = [string]$app.version
+          Write-Host "Aktuelle Version auf gbits.eu: $ver"
+
+          $dirs = gh api "repos/microsoft/winget-pkgs/contents/manifests/m/MT-Media/gbits" --jq '.[] | select(.type == "dir") | .name' 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $dirs) { Skip "$env:PKG ist noch nicht in winget (erster PR noch offen)." }
+          $known = @($dirs | Where-Object { $_ -match '^\d+(\.\d+)*$' } | ForEach-Object { [version]$_ })
+          $latest = ($known | Sort-Object | Select-Object -Last 1)
+          Write-Host "Neueste Version in winget: $latest"
+          if ($latest -and [version]$ver -le $latest) { Skip "winget ist aktuell ($latest)." }
+
+          $q = "repo:microsoft/winget-pkgs is:pr is:open in:title `"$env:PKG`" `"$ver`""
+          $open = gh api -X GET search/issues -f "q=$q" --jq .total_count
+          if ([int]$open -gt 0) { Skip "Für $ver ist schon ein PR offen." }
+
+          if (-not $env:WINGET_TOKEN) { Write-Host "::warning::Secret WINGET_TOKEN fehlt, PR für $ver wird nicht eingereicht."; "skip=true" >> $env:GITHUB_OUTPUT; exit 0 }
+
+          # Feste Adresse je Version (der Server archiviert jeden Installer), damit der Hash gültig bleibt.
+          $url = "https://gbits.eu/download/gbits-setup-$ver.exe"
+          Invoke-WebRequest $url -OutFile setup.exe -Headers @{ "User-Agent" = "gbits-winget-action" }
+          $sha = (Get-FileHash setup.exe -Algorithm SHA256).Hash.ToLower()
+          if ($app.sha256 -and $sha -ne ([string]$app.sha256).ToLower()) { throw "Hash von $url passt nicht zu /api/win/version ($sha vs $($app.sha256))." }
+          Write-Host "Installer $url, SHA256 $sha"
+
+          "skip=false" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "url=$url" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: PR bei winget-pkgs einreichen
+        if: steps.check.outputs.skip == 'false'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          URL: ${{ steps.check.outputs.url }}
+        run: |
+          Invoke-WebRequest "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+          .\wingetcreate.exe update $env:PKG --version $env:VERSION --urls $env:URL --submit --token $env:WINGET_TOKEN
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate ist fehlgeschlagen ($LASTEXITCODE)." }
